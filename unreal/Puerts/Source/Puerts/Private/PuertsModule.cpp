@@ -21,6 +21,10 @@
 #endif
 #include "Commandlets/Commandlet.h"
 #include "TypeScriptGeneratedClass.h"
+#include "Runtime/Launch/Resources/Version.h"
+#include "Misc/Paths.h"
+#include "Misc/CommandLine.h"
+#include "Misc/ConfigCacheIni.h"
 
 DEFINE_LOG_CATEGORY_STATIC(PuertsModule, Log, All);
 
@@ -192,12 +196,12 @@ public:
             if (Settings.DebugEnable)
             {
                 JsEnvGroup = MakeShared<puerts::FJsEnvGroup>(NumberOfJsEnv,
-                    std::make_shared<puerts::DefaultJSModuleLoader>(TEXT("JavaScript")), std::make_shared<puerts::FDefaultLogger>(),
+                    std::make_shared<puerts::DefaultJSModuleLoader>(Settings.RootPath), std::make_shared<puerts::FDefaultLogger>(),
                     DebuggerPortFromCommandLine < 0 ? Settings.DebugPort : DebuggerPortFromCommandLine);
             }
             else
             {
-                JsEnvGroup = MakeShared<puerts::FJsEnvGroup>(NumberOfJsEnv);
+                JsEnvGroup = MakeShared<puerts::FJsEnvGroup>(NumberOfJsEnv, Settings.RootPath);
             }
 
             if (Selector)
@@ -205,7 +209,7 @@ public:
                 JsEnvGroup->SetJsEnvSelector(Selector);
             }
 
-            //这种不支持等待
+            // 这种不支持等待
             if (Settings.WaitDebugger)
             {
                 UE_LOG(PuertsModule, Warning, TEXT("Do not support WaitDebugger in Group Mode!"));
@@ -218,13 +222,13 @@ public:
         {
             if (Settings.DebugEnable)
             {
-                JsEnv = MakeShared<puerts::FJsEnv>(std::make_shared<puerts::DefaultJSModuleLoader>(TEXT("JavaScript")),
+                JsEnv = MakeShared<puerts::FJsEnv>(std::make_shared<puerts::DefaultJSModuleLoader>(Settings.RootPath),
                     std::make_shared<puerts::FDefaultLogger>(),
                     DebuggerPortFromCommandLine < 0 ? Settings.DebugPort : DebuggerPortFromCommandLine);
             }
             else
             {
-                JsEnv = MakeShared<puerts::FJsEnv>();
+                JsEnv = MakeShared<puerts::FJsEnv>(Settings.RootPath);
             }
 
             if (Settings.WaitDebugger)
@@ -359,7 +363,12 @@ void FPuertsModule::RegisterSettings()
 #endif
     UPuertsSetting& Settings = *GetMutableDefault<UPuertsSetting>();
     const TCHAR* SectionName = TEXT("/Script/Puerts.PuertsSetting");
+#if (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 1) || ENGINE_MAJOR_VERSION > 5
+    const FString PuertsConfigIniPath =
+        FConfigCacheIni::NormalizeConfigIniPath(FPaths::SourceConfigDir().Append(TEXT("DefaultPuerts.ini")));
+#else
     const FString PuertsConfigIniPath = FPaths::SourceConfigDir().Append(TEXT("DefaultPuerts.ini"));
+#endif
     if (GConfig->DoesSectionExist(SectionName, PuertsConfigIniPath))
     {
         GConfig->GetBool(SectionName, TEXT("AutoModeEnable"), Settings.AutoModeEnable, PuertsConfigIniPath);
@@ -411,9 +420,14 @@ void FPuertsModule::StartupModule()
 #endif
 
 #if WITH_HOT_RELOAD
+#if ENGINE_MAJOR_VERSION >= 5
+    FCoreUObjectDelegates::ReloadCompleteDelegate.AddLambda(
+        [&](EReloadCompleteReason)
+#else
     IHotReloadInterface& HotReloadSupport = FModuleManager::LoadModuleChecked<IHotReloadInterface>("HotReload");
     HotReloadSupport.OnHotReload().AddLambda(
         [&](bool)
+#endif
         {
             if (Enabled)
             {

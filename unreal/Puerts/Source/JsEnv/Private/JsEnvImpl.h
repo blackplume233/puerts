@@ -13,15 +13,13 @@
 #include "StructWrapper.h"
 #include "CppObjectMapper.h"
 #include "V8Utils.h"
-#if !defined(ENGINE_INDEPENDENT_JSENV)
-#include "Engine/Engine.h"
-#endif
 #include "ObjectMapper.h"
 #include "JSLogger.h"
 #include "TickerDelegateWrapper.h"
 #if !defined(ENGINE_INDEPENDENT_JSENV)
 #include "TypeScriptGeneratedClass.h"
 #endif
+#include "UECompatible.h"
 #include "ContainerMeta.h"
 #include "ObjectCacheNode.h"
 #include <unordered_map>
@@ -42,6 +40,11 @@
 #include "node.h"
 #include "uv.h"
 #pragma warning(pop)
+#endif
+
+#if USE_WASM3
+#include "WasmRuntime.h"
+#include "PuertsWasm/WasmJsFunctionParams.h"
 #endif
 
 #if V8_MAJOR_VERSION < 8 || defined(WITH_QUICKJS) || defined(WITH_NODEJS) || (WITH_EDITOR && !defined(FORCE_USE_STATIC_V8_LIB))
@@ -72,11 +75,13 @@ public:
     explicit FJsEnvImpl(const FString& ScriptRoot);
 
     FJsEnvImpl(std::shared_ptr<IJSModuleLoader> InModuleLoader, std::shared_ptr<ILogger> InLogger, int InPort,
-        void* InExternalRuntime = nullptr, void* InExternalContext = nullptr);
+        std::function<void(const FString&)> InOnSourceLoadedCallback, void* InExternalRuntime = nullptr,
+        void* InExternalContext = nullptr);
 
     virtual ~FJsEnvImpl() override;
 
-    virtual void Start(const FString& ModuleName, const TArray<TPair<FString, UObject*>>& Arguments) override;
+    virtual void Start(
+        const FString& ModuleNameOrScript, const TArray<TPair<FString, UObject*>>& Arguments, bool IsScript) override;
 
     virtual bool IdleNotificationDeadline(double DeadlineInSeconds) override;
 
@@ -119,12 +124,23 @@ public:
 
     virtual void ReloadModule(FName ModuleName, const FString& JsSource) override;
 
+    virtual void ReloadSource(const FString& Path, const std::string& JsSource) override;
+
+    std::function<void(const FString&)> OnSourceLoadedCallback;
+
+    virtual void OnSourceLoaded(std::function<void(const FString&)> Callback) override;
+
 public:
-    virtual void Bind(UClass* Class, UObject* UEObject, v8::Local<v8::Object> JSObject) override;
+    bool IsTypeScriptGeneratedClass(UClass* Class);
+
+    virtual void Bind(FClassWrapper* ClassWrapper, UObject* UEObject, v8::Local<v8::Object> JSObject) override;
 
     virtual void UnBind(UClass* Class, UObject* UEObject) override;
 
     virtual void UnBind(UClass* Class, UObject* UEObject, bool ResetPointer);
+
+    v8::Local<v8::Value> FindOrAdd(
+        v8::Isolate* InIsolate, v8::Local<v8::Context>& Context, UClass* Class, UObject* UEObject, bool SkipTypeScriptInitial);
 
     virtual v8::Local<v8::Value> FindOrAdd(
         v8::Isolate* InIsolate, v8::Local<v8::Context>& Context, UClass* Class, UObject* UEObject) override;
@@ -190,6 +206,8 @@ public:
 
     virtual bool IsInstanceOfCppObject(const void* TypeId, v8::Local<v8::Object> JsObject) override;
 
+    virtual std::weak_ptr<int> GetJsEnvLifeCycleTracker() override;
+
     virtual v8::Local<v8::Value> AddSoftObjectPtr(v8::Isolate* Isolate, v8::Local<v8::Context> Context,
         FSoftObjectPtr* SoftObjectPtr, UClass* Class, bool IsSoftClass) override;
 
@@ -209,6 +227,8 @@ public:
     void InvokeJsMethod(UObject* ContextObject, UJSGeneratedFunction* Function, FFrame& Stack, void* RESULT_PARAM);
 
     void InvokeMixinMethod(UObject* ContextObject, UJSGeneratedFunction* Function, FFrame& Stack, void* RESULT_PARAM);
+
+    void TypeScriptInitial(UClass* Class, UObject* Object, const bool TypeScriptClassFound = false);
 
     void InvokeTsMethod(UObject* ContextObject, UFunction* Function, FFrame& Stack, void* RESULT_PARAM);
 
@@ -251,15 +271,23 @@ private:
 
     void LoadUEType(const v8::FunctionCallbackInfo<v8::Value>& Info);
 
+    void LoadCppType(const v8::FunctionCallbackInfo<v8::Value>& Info);
+
     void UEClassToJSClass(const v8::FunctionCallbackInfo<v8::Value>& Info);
 
     bool GetContainerTypeProperty(v8::Local<v8::Context> Context, v8::Local<v8::Value> Value, PropertyMacro** PropertyPtr);
 
     void NewContainer(const v8::FunctionCallbackInfo<v8::Value>& Info);
 
-    std::shared_ptr<FStructWrapper> GetStructWrapper(UStruct* InStruct);
+    std::shared_ptr<FStructWrapper> GetStructWrapper(UStruct* InStruct, bool& IsReuseTemplate);
 
-    v8::Local<v8::FunctionTemplate> GetTemplateOfClass(UStruct* Class, bool& Existed);
+    struct FTemplateInfo
+    {
+        v8::UniquePersistent<v8::FunctionTemplate> Template;
+        std::shared_ptr<FStructWrapper> StructWrapper;
+    };
+
+    FTemplateInfo* GetTemplateInfoOfType(UStruct* Class, bool& Existed);
 
     v8::Local<v8::Function> GetJsClass(UStruct* Class, v8::Local<v8::Context> Context);
 
@@ -272,7 +300,7 @@ private:
     void ReportExecutionException(
         v8::Isolate* Isolate, v8::TryCatch* TryCatch, std::function<void(const JSError*)> CompletionHandler);
 
-    void RemoveFTickerDelegateHandle(FDelegateHandle* Handle);
+    void RemoveFTickerDelegateHandle(FUETickDelegateHandle* Handle);
 
     void SetInterval(const v8::FunctionCallbackInfo<v8::Value>& Info);
 
@@ -344,7 +372,7 @@ private:
             if (auto Class = Cast<UClass>(Struct))
             {
                 UObject* Object = reinterpret_cast<UObject*>(Ptr);
-                if (!Object->IsValidLowLevel() || Object->IsPendingKill() || Object->GetClass() != Class ||
+                if (!Object->IsValidLowLevel() || UEObjectIsPendingKill(Object) || Object->GetClass() != Class ||
                     FV8Utils::GetPointer(JsObject))
                 {
                     return;
@@ -394,6 +422,21 @@ private:
 
     friend ObjectMerger;
 
+#if USE_WASM3
+    std::shared_ptr<WasmEnv> PuertsWasmEnv;
+    //在执行module.instance的时候,如果有指定memory,那么这个module对应会创建一个runtime
+    TArray<std::shared_ptr<WasmRuntime>> PuertsWasmRuntimeList;
+    TArray<WasmNormalLinkInfo*> PuertsWasmCachedLinkFunctionList;
+
+protected:
+    void Wasm_NewMemory(const v8::FunctionCallbackInfo<v8::Value>& Info);
+    void Wasm_MemoryGrowth(const v8::FunctionCallbackInfo<v8::Value>& Info);
+    void Wasm_MemoryBuffer(const v8::FunctionCallbackInfo<v8::Value>& Info);
+    void Wasm_Instance(const v8::FunctionCallbackInfo<v8::Value>& Info);
+    void Wasm_OverrideWebAssembly(const v8::FunctionCallbackInfo<v8::Value>& Info);
+
+#endif
+
 public:
 #if !defined(ENGINE_INDEPENDENT_JSENV)
     class TsDynamicInvokerImpl : public ITsDynamicInvoker
@@ -424,9 +467,9 @@ public:
         FJsEnvImpl* Parent;
     };
 
-    TSharedPtr<ITsDynamicInvoker> TsDynamicInvoker;
+    TSharedPtr<ITsDynamicInvoker, ESPMode::ThreadSafe> TsDynamicInvoker;
 
-    TSharedPtr<IDynamicInvoker> MixinInvoker;
+    TSharedPtr<IDynamicInvoker, ESPMode::ThreadSafe> MixinInvoker;
 #endif
 private:
     puerts::FObjectRetainer UserObjectRetainer;
@@ -484,14 +527,19 @@ private:
 
     v8::Global<v8::Function> Require;
 
+    v8::Global<v8::Function> GetESMMain;
+
     v8::Global<v8::Function> ReloadJs;
 
-    TMap<UStruct*, v8::UniquePersistent<v8::FunctionTemplate>> ClassToTemplateMap;
+#if !PUERTS_FORCE_CPP_UFUNCTION
+    v8::Global<v8::Function> MergePrototype;
+#endif
+
+    TMap<UStruct*, FTemplateInfo> TypeToTemplateInfoMap;
 
     TMap<FString, std::shared_ptr<FStructWrapper>> TypeReflectionMap;
 
     TMap<UObject*, v8::UniquePersistent<v8::Value>> ObjectMap;
-    TMap<const class UObjectBase*, v8::UniquePersistent<v8::Value>> GeneratedObjectMap;
 
     TMap<void*, FObjectCacheNode> StructCache;
 
@@ -499,7 +547,7 @@ private:
 
     FCppObjectMapper CppObjectMapper;
 
-#if !WITH_BACKING_STORE_AUTO_FREE
+#if !WITH_BACKING_STORE_AUTO_FREE && !defined(HAS_ARRAYBUFFER_NEW_WITHOUT_STL)
     struct ScriptStructFinalizeInfo
     {
         TWeakObjectPtr<UStruct> Struct;
@@ -602,7 +650,7 @@ private:
 
     void MakeSureInject(UTypeScriptGeneratedClass* Class, bool ForceReinject, bool RebindObject);
 #endif
-    TSharedPtr<DynamicInvokerImpl> DynamicInvoker;
+    TSharedPtr<DynamicInvokerImpl, ESPMode::ThreadSafe> DynamicInvoker;
 
     TSet<UClass*> GeneratedClasses;
 
@@ -622,9 +670,9 @@ private:
 
     bool ExtensionMethodsMapInited = false;
 
-    std::map<FDelegateHandle*, FTickerDelegateWrapper*> TickerDelegateHandleMap;
+    std::map<FUETickDelegateHandle*, FTickerDelegateWrapper*> TickerDelegateHandleMap;
 
-    FDelegateHandle DelegateProxiesCheckerHandler;
+    FUETickDelegateHandle DelegateProxiesCheckerHandler;
 
     V8Inspector* Inspector;
 
@@ -647,6 +695,29 @@ private:
 #ifdef SINGLE_THREAD_VERIFY
     uint32 BoundThreadId;
 #endif
+
+    typedef void (FJsEnvImpl::*V8MethodCallback)(const v8::FunctionCallbackInfo<v8::Value>& Info);
+
+    template <V8MethodCallback callback>
+    struct MethodBindingHelper
+    {
+        static void Bind(v8::Isolate* Isolate, v8::Local<v8::Context> Context, v8::Local<v8::Object> Obj, const char* Key,
+            v8::Local<v8::External> This)
+        {
+            Obj->Set(Context, FV8Utils::ToV8String(Isolate, Key),
+                   v8::FunctionTemplate::New(
+                       Isolate,
+                       [](const v8::FunctionCallbackInfo<v8::Value>& Info)
+                       {
+                           auto Self = static_cast<FJsEnvImpl*>((v8::Local<v8::External>::Cast(Info.Data()))->Value());
+                           (Self->*callback)(Info);
+                       },
+                       This)
+                       ->GetFunction(Context)
+                       .ToLocalChecked())
+                .Check();
+        }
+    };
 };
 
 }    // namespace puerts

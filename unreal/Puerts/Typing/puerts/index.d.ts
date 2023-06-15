@@ -17,6 +17,12 @@ declare module "puerts" {
     }
     
     type $Nullable<T> = T | null;
+
+    type cstring = string | ArrayBuffer;
+
+    function toCString(str:string) : ArrayBuffer;
+
+    function toCPtrArray(...ab:ArrayBuffer[]) : ArrayBuffer;
     
     function $ref<T>(x? : T) : $Ref<T>;
     
@@ -33,6 +39,9 @@ declare module "puerts" {
     
     //function requestJitModuleMethod(moduleName: string, methodName: string, callback: (err: Error, result: any)=> void, ... args: any[]): void;
     
+    /**
+     * @deprecated please use mixin instead! 
+    */
     function makeUClass(ctor: { new(): Object }): Class;
     
     function blueprint<T extends {
@@ -77,5 +86,3 @@ declare module "puerts" {
 
     function $async<T>(x: T) : AsyncObject<T>;*/
 }
-
-declare function require(name: string): any;
